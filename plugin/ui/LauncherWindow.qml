@@ -6,6 +6,7 @@ import qs.Commons as Commons
 import qs.Ui
 import "../core/Agent.js" as Agent
 import "../core/RootSearch.js" as RootSearch
+import "../core/Rows.js" as Rows
 
 // Omarchy 4.0.x dropped qs.Ui.OverlayWindow; this is the same full-screen
 // overlay layer the shell's own emoji picker uses.
@@ -15,6 +16,21 @@ PanelWindow {
   required property var backend
   property var appLibrary: null
   property bool shown: false
+  readonly property bool busy: window.shown && window.backend.loading
+  readonly property int loadingFeedbackDelay: 500
+  property bool loadingVisible: false
+
+  onBusyChanged: {
+    window.loadingVisible = false
+    if (window.busy) loadingDelay.restart()
+    else loadingDelay.stop()
+  }
+
+  Timer {
+    id: loadingDelay
+    interval: window.loadingFeedbackDelay
+    onTriggered: window.loadingVisible = window.busy
+  }
 
   signal dismissRequested()
 
@@ -48,6 +64,8 @@ PanelWindow {
   property string query: ""
   property int selectedIndex: -1
   property var selectedRow: null
+  property int searchSerial: 0
+  property bool searchPending: false
   property bool actionPanelOpen: false
   property var actions: []
   property var toast: null
@@ -115,6 +133,9 @@ PanelWindow {
 
   onShownChanged: {
     if (window.shown) return
+    window.searchSerial++
+    window.backend.cancelSearch()
+    window.searchPending = false
     window.closePopups()
     var seconds = Number(window.general.popToRootTimeout)
     if (!(seconds > 0)) window.popToRoot()
@@ -148,33 +169,46 @@ PanelWindow {
     var top = next[next.length - 1]
     window.stack = next
     window.query = top.query || ""
-    window.rebuild(false)
-    if (top.selectedIndex >= 0) window.select(top.selectedIndex)
+    window.rebuild(false, top.selectedIndex)
   }
 
 
-  function rebuild(resetSelection) {
+  function rebuild(resetSelection, restoreIndex) {
+    var serial = ++window.searchSerial
+    window.backend.cancelSearch()
     pointerGate.reset()
     var keepId = !resetSelection && window.selectedRow ? window.selectedRow.itemId : ""
-    rows.clear()
-    if (window.view.kind === "alias") { window.select(-1); return }
-    var result = window.backend.callSync("rootSearch.search", { query: window.query, view: window.view, filter: window.atRoot ? window.rootFilter : "all" })
+    window.searchPending = false
+    if (window.view.kind === "alias") { Rows.update(rows, []); window.select(-1); return }
+    window.searchPending = true
+    var revision = window.backend.candidatesRevision
+    window.backend.searchAsync({ query: window.query, view: window.view, filter: window.atRoot ? window.rootFilter : "all" }, function(result) {
+      if (serial !== window.searchSerial || revision !== window.backend.candidatesRevision) return
+      window.applySearch(result, keepId, restoreIndex)
+      window.searchPending = false
+    })
+  }
+
+  function applySearch(result, keepId, restoreIndex) {
     if (!result.ok) {
+      Rows.update(rows, [])
       window.showToast("failure", result.error)
       window.select(-1)
       return
     }
-    var keepIndex = -1
+    var keepIndex = -1, next = []
     for (var s = 0; s < result.data.length; s++) {
       var section = result.data[s]
-      if (section.title || s > 0) rows.append(window.rowData({ id: "section:" + section.id, title: section.title }, "section"))
+      if (section.title || s > 0) next.push(window.rowData({ id: "section:" + section.id, title: section.title }, "section"))
       for (var r = 0; r < section.rows.length; r++) {
         var c = section.rows[r]
-        if (c.id === keepId) keepIndex = rows.count
-        rows.append(window.rowData(c, c.kind === "calculator" ? "calculator" : "item"))
+        if (c.id === keepId) keepIndex = next.length
+        next.push(window.rowData(c, c.kind === "calculator" ? "calculator" : "item"))
       }
     }
-    window.select(keepIndex >= 0 ? keepIndex : window.nextSelectable(-1, 1))
+    Rows.update(rows, next)
+    if (restoreIndex >= 0 && restoreIndex < rows.count && window.isSelectable(restoreIndex)) window.select(restoreIndex)
+    else window.select(keepIndex >= 0 ? keepIndex : window.nextSelectable(-1, 1))
   }
 
   function rowData(c, kind) {
@@ -211,8 +245,14 @@ PanelWindow {
   }
 
   function select(index) {
+    if (index !== window.selectedIndex) {
+      var previous = list.itemAtIndex(window.selectedIndex)
+      if (previous) previous.selected = false
+    }
     window.selectedIndex = index
-    window.selectedRow = index >= 0 && index < rows.count ? rows.get(index) : null
+    var current = list.itemAtIndex(index)
+    if (current) current.selected = true
+    window.selectedRow = Rows.snapshot(rows, index)
     // Argument values belong to one command; a different row starts empty.
     var id = window.selectedRow ? window.selectedRow.itemId : ""
     if (id !== window.argsForId) {
@@ -260,12 +300,13 @@ PanelWindow {
 
 
   function actionsForSelected() {
-    if (!window.selectedRow) return []
+    if (window.searchPending || !window.selectedRow) return []
     var r = window.backend.callSync("rootSearch.getActions", { id: window.selectedRow.itemId })
     return r.ok ? r.data : []
   }
 
   function perform(actionId, index) {
+    if (window.searchPending) return
     if (index !== undefined && index >= 0) window.select(index)
     if (!window.selectedRow) return
     window.actionPanelOpen = false
@@ -315,16 +356,16 @@ PanelWindow {
   function toggleActionPanel() {
     if (window.actionPanelOpen) { window.actionPanelOpen = false; return }
     window.actions = window.actionsForSelected()
-    actionPanel.filter = ""
     window.actionPanelOpen = window.actions.length > 0
+    if (actionPanel.item) actionPanel.item.filter = ""
   }
 
   function toggleDropdown() {
     if (window.dropdownOpen || !window.atRoot) { window.dropdownOpen = false; return }
-    dropdown.filter = ""
     window.dropdownOpen = true
+    dropdown.item.filter = ""
     var at = RootSearch.FILTERS.map(function(f) { return f.id }).indexOf(window.rootFilter)
-    dropdown.selectedIndex = Math.max(0, at)
+    dropdown.item.selectedIndex = Math.max(0, at)
   }
 
   function setRootFilter(id) {
@@ -345,8 +386,8 @@ PanelWindow {
   function toggleToastPanel() {
     if (window.toastPanelOpen) { window.toastPanelOpen = false; toastTimer.restart(); return }
     if (!window.toast || !window.toast.actions.length) return
-    toastPanel.filter = ""
     window.toastPanelOpen = true
+    toastPanel.item.filter = ""
     toastTimer.stop()
   }
 
@@ -439,7 +480,7 @@ PanelWindow {
     var text = clipboardInput.text.replace(/[\r\n\u2028\u2029]+/g, " ")
     clipboardInput.clear()
     if (!text) return
-    if (window.actionPanelOpen) actionPanel.filter += text
+    if (window.actionPanelOpen) actionPanel.item.filter += text
     else if (window.argFocus >= 0) {
       var name = window.argDefs[window.argFocus].name
       var values = Object.assign({}, window.argValues)
@@ -548,15 +589,15 @@ PanelWindow {
     }
     if (window.dropdownOpen) {
       if (ctrl && !shift && key === Qt.Key_P) { window.dropdownOpen = false; return true }
-      return window.handlePopupKey(event, dropdown, ctrl, alt)
+      return window.handlePopupKey(event, dropdown.item, ctrl, alt)
     }
     if (window.toastPanelOpen) {
       if (ctrl && key === Qt.Key_T) { window.toggleToastPanel(); return true }
-      return window.handlePopupKey(event, toastPanel, ctrl, alt)
+      return window.handlePopupKey(event, toastPanel.item, ctrl, alt)
     }
     if (window.actionPanelOpen) {
       if (window.isActionPanelKey(ctrl, alt, shift, key)) { window.actionPanelOpen = false; return true }
-      return window.handlePopupKey(event, actionPanel, ctrl, alt)
+      return window.handlePopupKey(event, actionPanel.item, ctrl, alt)
     }
 
     if (window.view.kind === "alias") {
@@ -568,6 +609,8 @@ PanelWindow {
       if (window.isActionPanelKey(ctrl, alt, shift, key)) { window.toggleActionPanel(); return true }
       if (ctrl && !shift && key === Qt.Key_P) { window.toggleDropdown(); return true }
       if (ctrl && !shift && key === Qt.Key_T) { window.toggleToastPanel(); return true }
+      // Shift+Enter opens a new window for apps; Enter focuses an open one.
+      if (enter && shift && !ctrl && !alt && window.performIfOffered(["open-new"])) return true
       if (enter && ctrl && shift) { window.performNth(2); return true }
       if (enter && ctrl) { window.performNth(1); return true }
       if (enter) { window.performNth(0); return true }
@@ -828,22 +871,6 @@ PanelWindow {
         height: Style.spacing.hairline
         color: Util.alpha(window.look.foreground, 0.12)
         visible: !window.compact
-
-        Rectangle {
-          id: loader
-          visible: window.backend.loading && window.shown
-          height: Math.max(2, Style.space(2))
-          width: parent.width / 4
-          anchors.verticalCenter: parent.verticalCenter
-          color: window.look.accent
-          NumberAnimation on x {
-            running: loader.visible
-            loops: Animation.Infinite
-            from: -loader.width
-            to: header.width
-            duration: 900
-          }
-        }
       }
     }
 
@@ -865,10 +892,13 @@ PanelWindow {
         visible: window.view.kind !== "alias"
         clip: true
         model: rows
+        reuseItems: true
         boundsBehavior: Flickable.StopAtBounds
 
         delegate: ResultRow {
-          selected: index === window.selectedIndex
+          Component.onCompleted: selected = index === window.selectedIndex
+          ListView.onReused: selected = index === window.selectedIndex
+          ListView.onPooled: selected = false
           look: window.look
           appLibrary: window.appLibrary
           zoom: window.zoom
@@ -949,9 +979,10 @@ PanelWindow {
           color: window.toast && window.toast.style === "failure" ? "#e06c75" : window.look.accent
         }
         Text {
+          id: footerStatus
           anchors.verticalCenter: parent.verticalCenter
           textFormat: Text.PlainText
-          text: window.toast ? window.toast.title : window.view.title
+          text: window.toast ? window.toast.title : window.loadingVisible ? "Loading…" : window.view.title
           color: window.look.foreground
           opacity: window.toast ? 0.9 : 0.6
           elide: Text.ElideRight
@@ -1026,78 +1057,88 @@ PanelWindow {
       }
     }
 
-    ActionPanel {
+    Loader {
       id: actionPanel
-      visible: window.actionPanelOpen
+      active: window.actionPanelOpen
       z: 10
       anchors.right: parent.right
       anchors.rightMargin: card.borderRight + window.px(10)
       anchors.bottom: footer.top
       anchors.bottomMargin: window.px(6)
-      actions: window.actions
-      look: window.look
-      zoom: window.zoom
-      onActivated: function(actionId) { window.perform(actionId) }
+      sourceComponent: ActionPanel {
+        actions: window.actions
+        look: window.look
+        zoom: window.zoom
+        onActivated: function(actionId) { window.perform(actionId) }
+      }
     }
 
-    ActionPanel {
+    Loader {
       id: dropdown
-      visible: window.dropdownOpen
+      active: window.dropdownOpen
       z: 10
       width: window.px(240)
       anchors.right: parent.right
       anchors.rightMargin: card.borderRight + window.px(10)
       anchors.top: header.bottom
       anchors.topMargin: window.px(4)
-      placeholder: "Filter…"
-      actions: RootSearch.FILTERS.map(function(f) {
-        return { id: f.id, title: f.title, shortcut: "", section: "filter", icon: f.id === window.rootFilter ? "✓" : " " }
-      })
-      look: window.look
-      zoom: window.zoom
-      onActivated: function(id) { window.setRootFilter(id) }
+      sourceComponent: ActionPanel {
+        placeholder: "Filter…"
+        actions: RootSearch.FILTERS.map(function(f) {
+          return { id: f.id, title: f.title, shortcut: "", section: "filter", icon: f.id === window.rootFilter ? "✓" : " " }
+        })
+        look: window.look
+        zoom: window.zoom
+        onActivated: function(id) { window.setRootFilter(id) }
+      }
     }
 
-    ActionPanel {
+    Loader {
       id: toastPanel
-      visible: window.toastPanelOpen
+      active: window.toastPanelOpen
       z: 10
       width: window.px(280)
       anchors.left: parent.left
       anchors.leftMargin: card.borderLeft + window.px(10)
       anchors.bottom: footer.top
       anchors.bottomMargin: window.px(6)
-      placeholder: "Search toast actions…"
-      actions: (window.toast ? window.toast.actions : []).map(function(a) {
-        return { id: a.id, title: a.title, shortcut: "", section: "toast", icon: " " }
-      })
-      look: window.look
-      zoom: window.zoom
-      onActivated: function(id) { window.runToastAction(id) }
+      sourceComponent: ActionPanel {
+        placeholder: "Search toast actions…"
+        actions: (window.toast ? window.toast.actions : []).map(function(a) {
+          return { id: a.id, title: a.title, shortcut: "", section: "toast", icon: " " }
+        })
+        look: window.look
+        zoom: window.zoom
+        onActivated: function(id) { window.runToastAction(id) }
+      }
     }
 
-    InfoPanel {
-      visible: window.aboutOpen
+    Loader {
+      active: window.aboutOpen
       z: 10
       anchors.right: parent.right
       anchors.rightMargin: card.borderRight + window.px(10)
       anchors.bottom: footer.top
       anchors.bottomMargin: window.px(6)
-      title: window.selectedRow ? window.selectedRow.title : ""
-      rows: window.aboutRows
-      look: window.look
-      zoom: window.zoom
+      sourceComponent: InfoPanel {
+        title: window.selectedRow ? window.selectedRow.title : ""
+        rows: window.aboutRows
+        look: window.look
+        zoom: window.zoom
+      }
     }
 
-    Alert {
-      visible: !!window.alert
+    Loader {
+      active: !!window.alert
       z: 20
       anchors.fill: parent
-      spec: window.alert ? window.alert.spec : null
-      look: window.look
-      zoom: window.zoom
-      onConfirmed: window.confirmAlert()
-      onCancelled: window.alert = null
+      sourceComponent: Alert {
+        spec: window.alert ? window.alert.spec : null
+        look: window.look
+        zoom: window.zoom
+        onConfirmed: window.confirmAlert()
+        onCancelled: window.alert = null
+      }
     }
   }
 }
